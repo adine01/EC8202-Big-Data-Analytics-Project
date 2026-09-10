@@ -1,0 +1,446 @@
+# Ward vital-signs monitoring pipeline - single-laptop stack.
+# Memory budget and design rationale: docs/architecture_decision.md (sections 6, 7, 13).
+# All host ports bind to 127.0.0.1 only.
+
+name: ward-vitals
+
+# ---------------------------------------------------------------------------
+# Shared environment fragments. Each service receives only what it needs
+# (least privilege) instead of the whole .env file.
+# ---------------------------------------------------------------------------
+x-ward-db-env: &ward-db-env
+  WARD_DB_HOST: postgres
+  WARD_DB_PORT: "5432"
+  WARD_DB_NAME: ward
+  WARD_DB_USER: ward
+  WARD_DB_PASSWORD: ${WARD_DB_PASSWORD:?run `make env` to create .env}
+
+x-clock-env: &clock-env
+  SIM_DAY_SECONDS: ${SIM_DAY_SECONDS:-300}
+  SIM_START_DATE: ${SIM_START_DATE:-2026-01-01}
+  SIM_CLOCK_REFRESH_SECONDS: ${SIM_CLOCK_REFRESH_SECONDS:-30}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+
+x-kafka-env: &kafka-env
+  KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+  TOPIC_VITALS: ${TOPIC_VITALS:-vitals.raw}
+  TOPIC_LABS: ${TOPIC_LABS:-labs.raw}
+  TOPIC_ALERTS: ${TOPIC_ALERTS:-alerts.patient}
+  TOPIC_DEADLETTER: ${TOPIC_DEADLETTER:-deadletter}
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-airflow-common: &airflow-common
+  build:
+    context: .
+    dockerfile: airflow/Dockerfile
+  image: ward-vitals/airflow:local
+  user: "50000:0"
+  logging: *default-logging
+  environment: &airflow-env
+    <<: [*ward-db-env, *clock-env, *kafka-env]
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__PARALLELISM: "4"
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:?run `make env`}
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-apiserver:8080/execution/
+    AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS: admin:admin
+    AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_PASSWORDS_FILE: /opt/airflow/simple_auth_passwords.json
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:${AIRFLOW_DB_PASSWORD:?run `make env`}@postgres:5432/airflow
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET:?run `make env`}
+    AIRFLOW__API__SECRET_KEY: ${AIRFLOW_API_SECRET_KEY:?run `make env`}
+    AIRFLOW__API__WORKERS: "1"
+    AIRFLOW__DAG_PROCESSOR__REFRESH_INTERVAL: "30"
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+    # Lab ingestion DAG settings (simulated hours unless stated).
+    DATA_DIR: /opt/airflow/data
+    LAB_UPLOAD_HOUR: ${LAB_UPLOAD_HOUR:-6}
+    LAB_SLA_HOURS: ${LAB_SLA_HOURS:-4}
+    LAB_MAX_REJECT_RATE: ${LAB_MAX_REJECT_RATE:-0.2}
+    LAB_POKE_SECONDS: ${LAB_POKE_SECONDS:-10}
+    REPORTS_DIR: /opt/airflow/reports
+    REPORT_LABS_WAIT_SECONDS: ${REPORT_LABS_WAIT_SECONDS:-120}
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags
+    - ./data:/opt/airflow/data
+    - ./reports:/opt/airflow/reports
+    - airflow-logs:/opt/airflow/logs
+
+services:
+  # ------------------------------------------------------------------ storage
+  postgres:
+    image: postgres:17.11-alpine
+    restart: unless-stopped
+    mem_limit: 512m
+    logging: *default-logging
+    command: ["postgres", "-c", "shared_buffers=128MB", "-c", "max_connections=100"]
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD:?run `make env`}
+      WARD_DB_PASSWORD: ${WARD_DB_PASSWORD:?run `make env`}
+      AIRFLOW_DB_PASSWORD: ${AIRFLOW_DB_PASSWORD:?run `make env`}
+      GRAFANA_DB_PASSWORD: ${GRAFANA_DB_PASSWORD:?run `make env`}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5433}:5432"
+    healthcheck:
+      # TCP (-h 127.0.0.1) only opens after init scripts finish, unlike the socket.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d ward"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  clock-init:
+    # One-shot: create or resume the shared simulated clock.
+    image: ward-vitals/api:local
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    restart: "no"
+    logging: *default-logging
+    command: ["python", "-m", "ward_common.sim_clock", "init"]
+    environment:
+      <<: [*ward-db-env, *clock-env]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------- ingestion
+  kafka:
+    image: apache/kafka:4.1.2
+    restart: unless-stopped
+    mem_limit: 768m
+    logging: *default-logging
+    environment:
+      CLUSTER_ID: ${KAFKA_CLUSTER_ID:?run `make env`}
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9094
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:${KAFKA_HOST_PORT:-9094}
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # Topics are created explicitly by kafka-init; a typo in a producer must fail, not create a topic.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      KAFKA_HEAP_OPTS: -Xms256m -Xmx512m
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    ports:
+      - "127.0.0.1:${KAFKA_HOST_PORT:-9094}:9094"
+    healthcheck:
+      # Plain TCP probe: a JVM-based CLI probe would cost ~200 MB every interval.
+      test: ["CMD-SHELL", "nc -z localhost 9092"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  kafka-init:
+    image: apache/kafka:4.1.2
+    restart: "no"
+    logging: *default-logging
+    entrypoint: ["/bin/bash", "/scripts/create_topics.sh"]
+    environment:
+      <<: *kafka-env
+      KAFKA_HEAP_OPTS: -Xmx128m
+      VITALS_PARTITIONS: ${VITALS_PARTITIONS:-6}
+      LABS_PARTITIONS: ${LABS_PARTITIONS:-3}
+      ALERTS_PARTITIONS: ${ALERTS_PARTITIONS:-3}
+    volumes:
+      - ./kafka/create_topics.sh:/scripts/create_topics.sh:ro
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  vitals-simulator:
+    build:
+      context: .
+      dockerfile: simulators/Dockerfile
+    image: ward-vitals/simulators:local
+    restart: unless-stopped
+    mem_limit: 256m
+    logging: *default-logging
+    command: ["python", "-m", "ward_sim.vitals_producer"]
+    environment:
+      <<: [*ward-db-env, *clock-env, *kafka-env]
+      SIM_PATIENTS: ${SIM_PATIENTS:-20}
+      SIM_RATE: ${SIM_RATE:-20}
+      SIM_SEED: ${SIM_SEED:-42}
+      SIM_DETERIORATING_FRACTION: ${SIM_DETERIORATING_FRACTION:-0.5}
+      SIM_SPIKE_RATE: ${SIM_SPIKE_RATE:-0.01}
+      SIM_MALFORMED_RATE: ${SIM_MALFORMED_RATE:-0.02}
+      SIM_LATE_RATE: ${SIM_LATE_RATE:-0.02}
+      SIM_DUPLICATE_RATE: ${SIM_DUPLICATE_RATE:-0.01}
+      SIM_LATE_MIN_MINUTES: ${SIM_LATE_MIN_MINUTES:-5}
+      SIM_LATE_MAX_MINUTES: ${SIM_LATE_MAX_MINUTES:-120}
+      SIM_METRICS_PORT: "8001"
+    ports:
+      - "127.0.0.1:${VITALS_METRICS_HOST_PORT:-8001}:8001"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/metrics', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      clock-init:
+        condition: service_completed_successfully
+
+  lab-simulator:
+    image: ward-vitals/simulators:local
+    build:
+      context: .
+      dockerfile: simulators/Dockerfile
+    restart: unless-stopped
+    mem_limit: 128m
+    logging: *default-logging
+    command: ["python", "-m", "ward_sim.lab_generator"]
+    environment:
+      <<: [*ward-db-env, *clock-env]
+      # Same roster settings as vitals-simulator, so both describe the same patients.
+      SIM_PATIENTS: ${SIM_PATIENTS:-20}
+      SIM_SEED: ${SIM_SEED:-42}
+      SIM_DETERIORATING_FRACTION: ${SIM_DETERIORATING_FRACTION:-0.5}
+      DATA_DIR: /data
+      LAB_UPLOAD_HOUR: ${LAB_UPLOAD_HOUR:-6}
+      LAB_LATE_RATE: ${LAB_LATE_RATE:-0.10}
+      LAB_LATE_MAX_HOURS: ${LAB_LATE_MAX_HOURS:-8}
+      LAB_MISSING_RATE: ${LAB_MISSING_RATE:-0.05}
+      LAB_BAD_ROW_RATE: ${LAB_BAD_ROW_RATE:-0.03}
+      LAB_MAX_BACKFILL_DAYS: ${LAB_MAX_BACKFILL_DAYS:-2}
+      LAB_METRICS_PORT: "8002"
+    volumes:
+      - ./data:/data
+    ports:
+      - "127.0.0.1:${LAB_METRICS_HOST_PORT:-8002}:8002"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8002/metrics', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    depends_on:
+      clock-init:
+        condition: service_completed_successfully
+
+  # --------------------------------------------------------------- processing
+  spark:
+    build:
+      context: .
+      dockerfile: spark/Dockerfile
+    image: ward-vitals/spark:local
+    # Long-running streaming job; if a query fails the app exits and Docker
+    # restarts it, and every query resumes from its checkpoint.
+    restart: unless-stopped
+    mem_limit: 2g
+    logging: *default-logging
+    command:
+      - /opt/spark/bin/spark-submit
+      - --master
+      - local[4]
+      # Heap 768 MB is ample (state is a few thousand rows); the rest of the 2 GB
+      # limit covers metaspace, ~500 thread stacks, RocksDB and Python workers.
+      - --driver-memory
+      - 768m
+      - --driver-java-options
+      - -Xss512k -XX:MaxMetaspaceSize=256m -XX:ReservedCodeCacheSize=128m
+      - --conf
+      - spark.sql.shuffle.partitions=6
+      - --conf
+      - spark.ui.showConsoleProgress=false
+      - /opt/app/jobs/stream_processor.py
+    environment:
+      <<: [*ward-db-env, *clock-env, *kafka-env]
+      TZ: UTC
+      # glibc creates up to 8 x cores malloc arenas for a many-threaded JVM +
+      # RocksDB process, which inflates resident memory; 2 is the usual cap.
+      MALLOC_ARENA_MAX: "2"
+      CHECKPOINT_DIR: /opt/app/checkpoints
+      STREAM_WATERMARK: ${STREAM_WATERMARK:-30 minutes}
+      STREAM_TRIGGER: ${STREAM_TRIGGER:-5 seconds}
+      STREAM_SLOW_TRIGGER: ${STREAM_SLOW_TRIGGER:-15 seconds}
+      STREAM_MAX_OFFSETS_PER_TRIGGER: ${STREAM_MAX_OFFSETS_PER_TRIGGER:-20000}
+      TREND_MIN_READINGS: ${TREND_MIN_READINGS:-20}
+      SPARK_METRICS_PORT: "8003"
+    volumes:
+      - ./data/checkpoints:/opt/app/checkpoints
+    ports:
+      - "127.0.0.1:${SPARK_UI_HOST_PORT:-4040}:4040"
+      - "127.0.0.1:${SPARK_METRICS_HOST_PORT:-8003}:8003"
+    healthcheck:
+      # The metrics server starts only after the SparkSession and all queries are up.
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8003/metrics', timeout=3)"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 90s
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      clock-init:
+        condition: service_completed_successfully
+
+  # ------------------------------------------------------------- orchestration
+  airflow-init:
+    <<: *airflow-common
+    restart: "no"
+    command: ["airflow", "db", "migrate"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  airflow-apiserver:
+    <<: *airflow-common
+    restart: unless-stopped
+    mem_limit: 768m
+    # The admin password comes from .env and is written at start-up, so it is
+    # never stored in the image or the repository.
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - >-
+        printf '{"admin": "%s"}' "$$AIRFLOW_ADMIN_PASSWORD" > /opt/airflow/simple_auth_passwords.json
+        && exec /entrypoint airflow api-server
+    environment:
+      <<: *airflow-env
+      AIRFLOW_ADMIN_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:?run `make env`}
+    ports:
+      - "127.0.0.1:${AIRFLOW_HOST_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    restart: unless-stopped
+    mem_limit: 1g
+    command: ["airflow", "scheduler"]
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://localhost:8974/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      clock-init:
+        condition: service_completed_successfully
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    restart: unless-stopped
+    mem_limit: 512m
+    command: ["airflow", "dag-processor"]
+    healthcheck:
+      test: ["CMD-SHELL", "airflow jobs check --job-type DagProcessorJob --hostname \"$${HOSTNAME}\""]
+      interval: 60s
+      timeout: 30s
+      retries: 5
+      start_period: 60s
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ------------------------------------------------------------------ serving
+  api:
+    image: ward-vitals/api:local
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    restart: unless-stopped
+    mem_limit: 256m
+    logging: *default-logging
+    environment:
+      <<: [*ward-db-env, *clock-env]
+      REPORTS_DIR: /srv/reports
+      ALERT_ACTIVE_HOURS: ${ALERT_ACTIVE_HOURS:-2}
+      LAB_UPLOAD_HOUR: ${LAB_UPLOAD_HOUR:-6}
+      LAB_SLA_HOURS: ${LAB_SLA_HOURS:-4}
+    volumes:
+      - ./reports:/srv/reports:ro
+    ports:
+      - "127.0.0.1:${API_HOST_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    depends_on:
+      clock-init:
+        condition: service_completed_successfully
+
+  # ------------------------------------------------------------ observability
+  prometheus:
+    image: prom/prometheus:v3.5.1
+    restart: unless-stopped
+    mem_limit: 256m
+    logging: *default-logging
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=2d
+      - --web.enable-lifecycle
+    volumes:
+      - ./observability/prometheus:/etc/prometheus:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "127.0.0.1:${PROMETHEUS_HOST_PORT:-9090}:9090"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9090/-/healthy"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  grafana:
+    image: grafana/grafana:12.4.0
+    restart: unless-stopped
+    mem_limit: 256m
+    logging: *default-logging
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?run `make env`}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+      # Read by the provisioned Postgres datasource (read-only role).
+      GRAFANA_DB_PASSWORD: ${GRAFANA_DB_PASSWORD:?run `make env`}
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/etc/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "127.0.0.1:${GRAFANA_HOST_PORT:-3000}:3000"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    depends_on:
+      - prometheus
+      - postgres
+
+volumes:
+  pgdata:
+  kafka-data:
+  airflow-logs:
+  prometheus-data:
+  grafana-data:

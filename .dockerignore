@@ -1,0 +1,13 @@
+# Keep the build context small and never bake secrets or runtime data into images.
+.git
+.env
+.venv
+.claude
+**/__pycache__
+**/*.egg-info
+**/build
+data
+reports
+docs
+tests
+airflow/logs
