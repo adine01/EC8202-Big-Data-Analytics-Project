@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ward-common"
+version = "0.1.0"
+description = "Shared configuration, simulated clock and structured logging for the ward vitals pipeline"
+requires-python = ">=3.10"
+# Deliberately no runtime dependencies: this package is installed into the
+# Spark, Airflow, API and simulator images, and must never conflict with
+# their pinned dependency sets. The database helpers import psycopg lazily.
+dependencies = []
+
+[project.optional-dependencies]
+db = ["psycopg[binary]>=3.2"]
+
+[tool.setuptools]
+packages = ["ward_common"]
