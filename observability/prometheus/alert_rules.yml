@@ -1,0 +1,163 @@
+# Prometheus alert rules for the ward pipeline, grouped by pipeline stage.
+# All durations here are REAL time (Prometheus runs on wall-clock time).
+# Evaluated by Prometheus; firing alerts are visible at http://localhost:9090/alerts
+# and on the Grafana dashboard ("Alerts firing" panel). Routing to email/pager
+# (Alertmanager) is a documented production improvement.
+
+groups:
+  # ------------------------------------------------------------ ingestion
+  - name: ward-ingestion
+    rules:
+      - alert: VitalsNotReceived
+        # Required alert 1: no vitals have reached the processing layer for 2 real minutes
+        # (= ~9.6 simulated hours at the default speed). absent() covers "never started".
+        expr: |
+          (time() - spark_vitals_last_processed_timestamp_seconds) > 120
+          or absent(spark_vitals_last_processed_timestamp_seconds)
+        for: 30s
+        labels: {severity: critical, stage: ingestion}
+        annotations:
+          summary: "No vitals processed for over 2 minutes"
+          description: "Last vitals micro-batch was {{ $value | humanizeDuration }} ago. Check VitalsProducerSilent (source) vs StreamingQueryDown (processing)."
+          runbook: "make logs s=vitals-simulator; make logs s=spark; make offsets"
+
+      - alert: VitalsProducerSilent
+        # Distinguishes a dead source from a dead consumer.
+        expr: sum(rate(vitals_events_sent_total[2m])) == 0 or absent(vitals_events_sent_total)
+        for: 1m
+        labels: {severity: critical, stage: ingestion}
+        annotations:
+          summary: "The bedside-monitor simulator is not producing"
+          description: "vitals_events_sent_total has not increased for 2 minutes."
+          runbook: "make logs s=vitals-simulator"
+
+      - alert: KafkaDeliveryErrors
+        expr: sum(increase(vitals_delivery_total{result="error"}[5m])) > 0
+        for: 0m
+        labels: {severity: warning, stage: ingestion}
+        annotations:
+          summary: "Kafka rejected vitals messages"
+          description: "{{ $value }} delivery errors in the last 5 minutes."
+
+  # ----------------------------------------------------------- processing
+  - name: ward-processing
+    rules:
+      - alert: HighInvalidRecordRate
+        # Required alert 2: invalid (dead-lettered) share of vitals above 5 % over 5 minutes.
+        # The simulator injects ~2 %, so this fires only on a genuine data-quality problem.
+        expr: |
+          sum(rate(spark_vitals_records_total{status="invalid"}[5m]))
+            / sum(rate(spark_vitals_records_total[5m])) > 0.05
+        for: 1m
+        labels: {severity: warning, stage: processing}
+        annotations:
+          summary: "Invalid vitals rate above 5 %"
+          description: "{{ $value | humanizePercentage }} of vitals were rejected in the last 5 minutes. See the dead_letter table for reasons."
+          runbook: "make psql -> SELECT error_reasons[1], count(*) FROM dead_letter GROUP BY 1 ORDER BY 2 DESC;"
+
+      - alert: StreamingQueryDown
+        expr: spark_query_active == 0
+        for: 30s
+        labels: {severity: critical, stage: processing}
+        annotations:
+          summary: "Spark streaming query {{ $labels.query }} is not running"
+          description: "The Spark app restarts automatically and resumes from its checkpoint; persistent failure needs investigation."
+          runbook: "make logs s=spark"
+
+      - alert: KafkaConsumerLagHigh
+        expr: max by (query) (spark_query_kafka_lag_records) > 5000
+        for: 2m
+        labels: {severity: warning, stage: processing}
+        annotations:
+          summary: "Spark query {{ $labels.query }} is {{ $value }} records behind Kafka"
+          description: "Processing is slower than ingestion (or catching up after a replay)."
+
+      - alert: LateEventsDropped
+        # A share, not a count: the simulator delivers ~2 % of readings late and ~80 % of
+        # those miss the watermark, so ~1.6 % dropped is normal; > 3 % means a real delay problem.
+        expr: |
+          sum(increase(spark_query_rows_dropped_by_watermark_total{query="vitals_windows"}[5m]))
+            / sum(increase(spark_query_input_rows_total{query="vitals_windows"}[5m])) > 0.03
+        for: 1m
+        labels: {severity: info, stage: processing}
+        annotations:
+          summary: "Unusually many readings arrive later than the watermark"
+          description: "{{ $value | humanizePercentage }} of readings dropped as too late (watermark = 30 simulated minutes)."
+
+  # ------------------------------------------------------------------ batch
+  - name: ward-batch
+    rules:
+      - alert: LabFileMissing
+        # Required alert 3 (missing): yesterday's lab file not received by the simulated SLA
+        # deadline (06:00 + LAB_SLA_HOURS, simulated time), computed by the API from the ledger.
+        expr: ward_lab_file_overdue == 1
+        for: 15s
+        labels: {severity: critical, stage: batch}
+        annotations:
+          summary: "Daily lab file missing"
+          description: "Yesterday's lab file was not received by its simulated SLA deadline; the daily risk report will be produced without it."
+          runbook: "make landing; make lab-loads; redeliver with make lab-day d=YYYY-MM-DD"
+
+      - alert: LabFileLate
+        # Required alert 3 (late): more than 2 simulated hours past the scheduled upload.
+        expr: ward_lab_file_hours_late > 2 and ward_lab_file_overdue == 0
+        for: 15s
+        labels: {severity: warning, stage: batch}
+        annotations:
+          summary: "Daily lab file late"
+          description: "Yesterday's lab file is {{ $value }} simulated hours late (SLA = 4 h)."
+
+      - alert: LabFileQuarantined
+        expr: delta(ward_lab_files{status="quarantined"}[10m]) > 0
+        for: 0m
+        labels: {severity: warning, stage: batch}
+        annotations:
+          summary: "A lab file was quarantined"
+          description: "More than 20 % of its rows failed validation; nothing from it was published."
+          runbook: "make lab-loads; inspect data/quarantine/"
+
+      - alert: AirflowTaskFailed
+        expr: sum by (dag_id, task_id) (increase(ward_pipeline_task_runs_total{state="failed"}[10m])) > 0
+        for: 0m
+        labels: {severity: warning, stage: batch}
+        annotations:
+          summary: "Airflow task {{ $labels.dag_id }}.{{ $labels.task_id }} failed"
+          description: "See the Airflow UI (http://localhost:8080) for the task log."
+
+  # ---------------------------------------------------- storage & serving
+  - name: ward-storage-serving
+    rules:
+      - alert: TargetDown
+        expr: up == 0
+        for: 1m
+        labels: {severity: critical, stage: platform}
+        annotations:
+          summary: "{{ $labels.job }} is not reachable by Prometheus"
+          description: "Scrape target {{ $labels.instance }} has been down for 1 minute."
+
+      - alert: DatabaseUnavailable
+        expr: ward_db_up == 0
+        for: 1m
+        labels: {severity: critical, stage: storage}
+        annotations:
+          summary: "The API cannot read from Postgres"
+
+      - alert: ApiErrorRate
+        expr: |
+          sum(rate(ward_api_requests_total{status=~"5.."}[5m]))
+            / sum(rate(ward_api_requests_total[5m])) > 0.05
+        for: 2m
+        labels: {severity: warning, stage: serving}
+        annotations:
+          summary: "More than 5 % of API requests fail"
+
+  # --------------------------------------------------------------- clinical
+  - name: ward-clinical
+    rules:
+      - alert: HighRiskPatientOnWard
+        # Informational: the per-patient alerts themselves live in the alerts table / API.
+        expr: ward_patients_by_tier{tier="HIGH"} > 0
+        for: 30s
+        labels: {severity: info, stage: clinical}
+        annotations:
+          summary: "{{ $value }} patient(s) currently at HIGH risk (illustrative score)"

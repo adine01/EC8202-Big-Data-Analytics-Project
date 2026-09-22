@@ -1,0 +1,28 @@
+# One scrape job per pipeline stage. Alert rules: alert_rules.yml.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - alert_rules.yml
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  - job_name: api
+    static_configs:
+      - targets: ["api:8000"]
+
+  - job_name: vitals-simulator
+    static_configs:
+      - targets: ["vitals-simulator:8001"]
+
+  - job_name: lab-simulator
+    static_configs:
+      - targets: ["lab-simulator:8002"]
+
+  - job_name: spark-stream
+    static_configs:
+      - targets: ["spark:8003"]

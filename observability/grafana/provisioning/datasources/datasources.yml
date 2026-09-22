@@ -1,0 +1,25 @@
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+
+  # Read-only role: Grafana can never modify pipeline data.
+  - name: Ward Postgres
+    uid: ward-postgres
+    type: grafana-postgresql-datasource
+    url: postgres:5432
+    user: grafana_ro
+    editable: false
+    jsonData:
+      database: ward
+      sslmode: disable
+      postgresVersion: 1700
+      timescaledb: false
+    secureJsonData:
+      password: $GRAFANA_DB_PASSWORD
