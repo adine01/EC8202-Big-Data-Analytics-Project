@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ward Risk Report {{ day }}</title>
+<style>
+  :root { --ink:#1d2433; --muted:#5b6475; --line:#e3e6ec; --bg:#ffffff; --panel:#f6f7f9;
+          --high:#b42318; --high-bg:#fdeceb; --med:#b54708; --med-bg:#fef4e6; --low:#067647; --low-bg:#e8f6ee; }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 24px 16px 48px; font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+         color: var(--ink); background: var(--bg); }
+  main { max-width: 1200px; margin: 0 auto; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  h2 { font-size: 16px; margin: 32px 0 8px; }
+  .muted { color: var(--muted); }
+  .disclaimer { margin: 16px 0; padding: 10px 12px; border-left: 4px solid var(--med); background: var(--med-bg); }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; margin-top: 16px; }
+  .tile { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px; }
+  .tile .value { font-size: 24px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .tile .label { color: var(--muted); font-size: 12px; }
+  .table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 8px; }
+  table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+  th, td { padding: 7px 10px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; white-space: nowrap; }
+  th { background: var(--panel); font-weight: 600; font-size: 12px; color: var(--muted); }
+  td.num, th.num { text-align: right; }
+  td.wrap { white-space: normal; min-width: 220px; }
+  .tier { display: inline-block; padding: 1px 8px; border-radius: 999px; font-weight: 600; font-size: 12px; }
+  .tier.HIGH { color: var(--high); background: var(--high-bg); }
+  .tier.MEDIUM { color: var(--med); background: var(--med-bg); }
+  .tier.LOW { color: var(--low); background: var(--low-bg); }
+  .tier.NO_DATA { color: var(--muted); background: var(--panel); }
+  .up { color: var(--high); font-weight: 600; }
+  .flag-H, .flag-L { color: var(--high); font-weight: 600; }
+  footer { margin-top: 32px; font-size: 12px; }
+  @media print { body { padding: 0; } .table-wrap { border: none; } }
+</style>
+</head>
+<body>
+<main>
+  <h1>Ward risk report - {{ day }}</h1>
+  <div class="muted">Simulated day {{ day }} · generated {{ meta.generated_at_sim }} (simulated) / {{ meta.generated_at_real }} (real) · lab file: {{ meta.labs_status }}</div>
+
+  <div class="disclaimer"><strong>Synthetic data - not clinical.</strong> Risk scores use a simplified, partial
+  NEWS2-style score (heart rate, SpO₂, systolic BP, temperature) adjusted by lab results and vital-sign trends.
+  They are illustrative for a data-engineering exercise and must not inform any medical decision.</div>
+
+  <div class="tiles">
+    <div class="tile"><div class="value">{{ summary.patients }}</div><div class="label">patients</div></div>
+    <div class="tile"><div class="value">{{ summary.tiers.HIGH }}</div><div class="label"><span class="tier HIGH">HIGH</span> risk</div></div>
+    <div class="tile"><div class="value">{{ summary.tiers.MEDIUM }}</div><div class="label"><span class="tier MEDIUM">MEDIUM</span> risk</div></div>
+    <div class="tile"><div class="value">{{ summary.tiers.LOW }}</div><div class="label"><span class="tier LOW">LOW</span> risk</div></div>
+    <div class="tile"><div class="value">{{ summary.escalated_by_labs }}</div><div class="label">tier raised by labs</div></div>
+    <div class="tile"><div class="value">{{ summary.deteriorating }}</div><div class="label">deteriorating at day end</div></div>
+    <div class="tile"><div class="value">{{ summary.alerts }}</div><div class="label">alerts during the day</div></div>
+  </div>
+
+  <h2>Patients by risk (highest first)</h2>
+  <p class="muted">End-of-day EWS uses the averages of the last 4 simulated hours. Labs: latest result per test collected in the 48 h up to the end of the day.
+  "Vitals only" is the tier before labs; an arrow marks patients whose tier the labs raised.</p>
+  <div class="table-wrap">
+  <table>
+    <thead><tr>
+      <th>Patient</th><th>Bed</th><th>Vitals only</th><th>With labs</th>
+      <th class="num">Score</th><th class="num">EWS end</th><th class="num">EWS peak</th>
+      <th>Trend</th><th class="num">Hrs HIGH</th><th class="num">Alerts c/h/m</th>
+      <th class="num">Lab adj.</th><th>Latest labs</th>
+    </tr></thead>
+    <tbody>
+    {% for r in rows %}
+      <tr>
+        <td>{{ r.patient_id }}</td><td>{{ r.bed }}</td>
+        <td><span class="tier {{ r.vitals_only_tier }}">{{ r.vitals_only_tier }}</span></td>
+        <td>{% if r.tier_change == 'escalated' %}<span class="up">↑</span> {% endif %}<span class="tier {{ r.risk_tier }}">{{ r.risk_tier }}</span></td>
+        <td class="num">{{ r.total_score if r.total_score is not none else '-' }}</td>
+        <td class="num">{{ r.ews_end if r.ews_end is not none else '-' }}{% if r.red_flag %} ⚑{% endif %}</td>
+        <td class="num">{{ r.ews_peak if r.ews_peak is not none else '-' }}</td>
+        <td>{{ r.trend_last }}{% if r.deteriorating_windows %} ({{ r.deteriorating_windows }} det.){% endif %}</td>
+        <td class="num">{{ r.hours_high }}</td>
+        <td class="num">{{ r.alerts_critical }}/{{ r.alerts_high }}/{{ r.alerts_medium }}</td>
+        <td class="num">{{ '+' ~ r.lab_adjustment if r.lab_adjustment else '0' }}</td>
+        <td class="wrap">{% for test, v in r.labs|dictsort %}<span class="flag-{{ v.flag }}">{{ test }} {{ '%g'|format(v.value) }}{% if v.flag != 'N' %} ({{ v.flag }}){% endif %}</span>{% if not loop.last %} · {% endif %}{% else %}<span class="muted">no labs in 48 h</span>{% endfor %}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  <p class="muted">⚑ = at least one vital sign scored 3 (NEWS2 "red" parameter). Score = end-of-day EWS + trend adjustment + lab adjustment.</p>
+
+  <h2>Data quality</h2>
+  <div class="table-wrap"><table>
+    <tr><th>Lab file for {{ day }}</th><td>{{ meta.labs_status }}</td></tr>
+    <tr><th>Lab rows loaded / rejected</th><td>{{ meta.lab_rows_valid }} / {{ meta.lab_rows_rejected }}</td></tr>
+    <tr><th>Patients without vitals windows</th><td>{{ summary.tiers.NO_DATA }}</td></tr>
+  </table></div>
+
+  <h2>Appendix: evaluation against simulation ground truth</h2>
+  <p class="muted">Each synthetic patient follows a hidden storyline. It is never used for scoring; it is shown only to judge
+  whether the pipeline ranks the right patients. "Recovering" patients were unwell only at the start of the simulation.</p>
+  <div class="table-wrap"><table>
+    <thead><tr><th>Storyline</th><th class="num">HIGH</th><th class="num">MEDIUM</th><th class="num">LOW</th><th class="num">No data</th></tr></thead>
+    <tbody>
+    {% for storyline, counts in evaluation.items() %}
+      <tr><td>{{ storyline }}</td><td class="num">{{ counts.HIGH }}</td><td class="num">{{ counts.MEDIUM }}</td><td class="num">{{ counts.LOW }}</td><td class="num">{{ counts.NO_DATA }}</td></tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+
+  <footer class="muted">Generated by the <code>daily_risk_report</code> DAG · run {{ meta.run_id }}</footer>
+</main>
+</body>
+</html>
