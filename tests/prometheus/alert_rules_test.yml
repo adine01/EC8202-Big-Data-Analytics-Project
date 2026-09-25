@@ -1,0 +1,126 @@
+# promtool unit tests for observability/prometheus/alert_rules.yml
+# Run: make test-alerts   (promtool test rules, inside the Prometheus image)
+# Series notation: 'a+bxN' = start at a, add b each interval, N more samples.
+
+rule_files:
+  - ../../observability/prometheus/alert_rules.yml
+
+evaluation_interval: 15s
+
+tests:
+  # --- Required alert 1: no vitals received ----------------------------------
+  - interval: 15s
+    input_series:
+      # Last processed at t=0 and never again: time() - 0 grows past 120 s.
+      - series: spark_vitals_last_processed_timestamp_seconds
+        values: '0x20'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: VitalsNotReceived
+        exp_alerts: []                       # only 60 s old: fine
+      - eval_time: 3m
+        alertname: VitalsNotReceived
+        exp_alerts:
+          - exp_labels: {severity: critical, stage: ingestion}
+            exp_annotations:
+              summary: "No vitals processed for over 2 minutes"
+              description: "Last vitals micro-batch was 3m 0s ago. Check VitalsProducerSilent (source) vs StreamingQueryDown (processing)."
+              runbook: "make logs s=vitals-simulator; make logs s=spark; make offsets"
+
+  - interval: 15s
+    input_series:
+      # Healthy: the timestamp keeps up with the clock (15 s per sample).
+      - series: spark_vitals_last_processed_timestamp_seconds
+        values: '0+15x20'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: VitalsNotReceived
+        exp_alerts: []
+
+  # --- Required alert 2: invalid-record rate ----------------------------------
+  - interval: 15s
+    input_series:
+      # 10 invalid of 100 per 15 s = 10 % invalid.
+      - series: 'spark_vitals_records_total{status="valid"}'
+        values: '0+90x40'
+      - series: 'spark_vitals_records_total{status="invalid"}'
+        values: '0+10x40'
+    alert_rule_test:
+      - eval_time: 30s
+        alertname: HighInvalidRecordRate
+        exp_alerts: []                       # pending (for: 1m), not yet firing
+      - eval_time: 3m
+        alertname: HighInvalidRecordRate
+        exp_alerts:
+          - exp_labels: {severity: warning, stage: processing}
+            exp_annotations:
+              summary: "Invalid vitals rate above 5 %"
+              description: "10% of vitals were rejected in the last 5 minutes. See the dead_letter table for reasons."
+              runbook: "make psql -> SELECT error_reasons[1], count(*) FROM dead_letter GROUP BY 1 ORDER BY 2 DESC;"
+
+  - interval: 15s
+    input_series:
+      # The simulator's normal 2 % must NOT fire.
+      - series: 'spark_vitals_records_total{status="valid"}'
+        values: '0+98x40'
+      - series: 'spark_vitals_records_total{status="invalid"}'
+        values: '0+2x40'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: HighInvalidRecordRate
+        exp_alerts: []
+
+  # --- Required alert 3: lab file missing or late -------------------------------
+  - interval: 15s
+    input_series:
+      - series: ward_lab_file_overdue
+        values: '0 0 1 1 1 1'
+      - series: ward_lab_file_hours_late
+        values: '0 3 5 5 5 5'
+    alert_rule_test:
+      - eval_time: 45s
+        alertname: LabFileLate
+        exp_alerts: []                       # at 45 s it is already overdue -> Missing, not Late
+      - eval_time: 30s
+        alertname: LabFileMissing
+        exp_alerts: []                       # pending for 15 s
+      - eval_time: 1m
+        alertname: LabFileMissing
+        exp_alerts:
+          - exp_labels: {severity: critical, stage: batch}
+            exp_annotations:
+              summary: "Daily lab file missing"
+              description: "Yesterday's lab file was not received by its simulated SLA deadline; the daily risk report will be produced without it."
+              runbook: "make landing; make lab-loads; redeliver with make lab-day d=YYYY-MM-DD"
+
+  - interval: 15s
+    input_series:
+      # 3 simulated hours late but still inside the 4 h SLA -> Late (warning), not Missing.
+      - series: ward_lab_file_overdue
+        values: '0x8'
+      - series: ward_lab_file_hours_late
+        values: '3x8'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: LabFileLate
+        exp_alerts:
+          - exp_labels: {severity: warning, stage: batch}
+            exp_annotations:
+              summary: "Daily lab file late"
+              description: "Yesterday's lab file is 3 simulated hours late (SLA = 4 h)."
+      - eval_time: 1m
+        alertname: LabFileMissing
+        exp_alerts: []
+
+  # --- Late events: a share, not a count ----------------------------------------------
+  - interval: 15s
+    input_series:
+      # ~1.6 % dropped (the simulator's normal level) must not fire.
+      - series: 'spark_query_rows_dropped_by_watermark_total{query="vitals_windows"}'
+        values: '0+4x40'
+      - series: 'spark_query_input_rows_total{query="vitals_windows"}'
+        values: '0+250x40'
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: LateEventsDropped
+        exp_alerts: []
